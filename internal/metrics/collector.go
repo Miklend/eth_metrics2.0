@@ -83,6 +83,5 @@ func (c *CollectorEtherscan) CollectAndSaveGas() error {
 		return fmt.Errorf("ошибка при сохранении метрик газа: %v", err)
 	}
 
-	logger.Logger.WithField("lastBlock", gasStats.Result.LastBlock).Info("Метрики газа успешно сохранены")
 	return nil
 }

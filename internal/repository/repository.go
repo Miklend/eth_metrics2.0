@@ -74,7 +74,6 @@ func (r *PostgresRepository) SaveMetricsGas(lastBlock, safeGasPrice, proposeGasP
 		return fmt.Errorf("ошибка при сохранении метрик: %v", err)
 	}
 
-	logger.Logger.WithField("lastBlock", lastBlock).Info("Метрики успешно сохранены")
 	return nil
 }
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"time"
 
 	"eth_metrics2.0/internal/client"
@@ -10,41 +9,74 @@ import (
 	"eth_metrics2.0/internal/logger"
 	"eth_metrics2.0/internal/metrics"
 	"eth_metrics2.0/internal/repository"
+	"github.com/cenkalti/backoff/v4"
 )
 
 func main() {
-	// Загрузка конфигурации
-	cfg := config.Load()
-
 	// Инициализация логгера
 	logger.Init()
 
-	// Подключение к PostgreSQL
+	// Загрузка конфигурации
+	cfg := config.Load()
+
+	// Подключение к PostgreSQL с повторными попытками
 	var repo repository.Repository
-	repo, err := repository.NewPostgresRepository()
+	retryBackoff := backoff.NewExponentialBackOff()
+	retryBackoff.MaxElapsedTime = time.Minute * 5 // Ограничение на общее время попыток
+
+	err := backoff.Retry(func() error {
+		var err error
+		repo, err = repository.NewPostgresRepository()
+		if err != nil {
+			return fmt.Errorf("не удалось подключиться к PostgreSQL: %v", err)
+		}
+		return nil
+	}, retryBackoff)
+
 	if err != nil {
-		log.Fatalf("Не удалось подключиться к PostgreSQL: %v", err)
+		logger.Logger.WithError(err).Fatal("Не удалось подключиться к PostgreSQL после нескольких попыток")
 	}
 	defer repo.Close()
 
 	// Создание клиента для работы с Etherscan API
 	ethClient := client.NewEthereumClientEtherscan(cfg.ETHERSCAN_API_KEY)
+	logger.Logger.Info("Создан клиент для работы с Etherscan API")
 
 	// Создание сборщика метрик
 	collectorGas := metrics.NewCollectorEtherscan(ethClient, repo)
 
-	// Интервал в 8 секунд, можно заменить на конфигурируемую переменную
+	// Канал для передачи результатов и ошибок
+	resultCh := make(chan string)
+	errorCh := make(chan error)
+
+	// Интервал для сбора метрик
 	interval := 8 * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	// Бесконечный цикл для сбора метрик каждые 5 секунд
-	for range ticker.C {
-		// Сбор и сохранение метрик
-		if err := collectorGas.CollectAndSaveGas(); err != nil {
-			log.Printf("Ошибка при сборе метрик: %v", err)
-		} else {
-			fmt.Println("Метрики успешно собраны и сохранены.", time.Now())
+	// Бесконечный цикл для сбора метрик каждые 8 секунд
+	go func() {
+		for range ticker.C {
+			// Сбор и сохранение метрик с повторными попытками
+			err := backoff.Retry(func() error {
+				return collectorGas.CollectAndSaveGas()
+			}, retryBackoff)
+
+			if err != nil {
+				errorCh <- fmt.Errorf("Ошибка при сборе метрик: %v", err)
+			} else {
+				resultCh <- "Метрики успешно собраны и сохранены."
+			}
+		}
+	}()
+
+	// Обработка результатов и ошибок
+	for {
+		select {
+		case result := <-resultCh:
+			logger.Logger.Info(result)
+		case err := <-errorCh:
+			logger.Logger.WithError(err).Error("Ошибка при сборе метрик")
 		}
 	}
 }
