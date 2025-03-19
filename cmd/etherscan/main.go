@@ -43,10 +43,9 @@ func main() {
 	logger.Logger.Info("Создан клиент для работы с Etherscan API")
 
 	// Создание сборщика метрик
-	collectorGas := metrics.NewCollectorEtherscan(ethClient, repo)
+	collectorBlock := metrics.NewCollectorEtherscan(ethClient, repo)
 
 	// Канал для передачи результатов и ошибок
-	resultCh := make(chan string)
 	errorCh := make(chan error)
 
 	// Интервал для сбора метрик
@@ -59,22 +58,18 @@ func main() {
 		for range ticker.C {
 			// Сбор и сохранение метрик с повторными попытками
 			err := backoff.Retry(func() error {
-				return collectorGas.CollectAndSaveGas()
+				return collectorBlock.CollectAndSave()
 			}, retryBackoff)
 
 			if err != nil {
 				errorCh <- fmt.Errorf("Ошибка при сборе метрик: %v", err)
-			} else {
-				resultCh <- "Метрики успешно собраны и сохранены."
 			}
 		}
 	}()
 
 	// Обработка результатов и ошибок
-	for {
+	for range errorCh {
 		select {
-		case result := <-resultCh:
-			logger.Logger.Info(result)
 		case err := <-errorCh:
 			logger.Logger.WithError(err).Error("Ошибка при сборе метрик")
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"eth_metrics2.0/internal/logger"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -35,42 +36,62 @@ func NewPostgresRepository() (*PostgresRepository, error) {
 
 // Интерфейс репозитория
 type Repository interface {
-	SaveMetricsGas(lastBlock, safeGasPrice, proposeGasPrice, fastGasPrice, suggestBaseFee string) error
+	SaveMetrics(primaryKeyValue interface{}, primaryKeyField string, metrics map[string]interface{}, nameTable string) error
 	Close()
 }
 
 // Метод для сохранения метрик газа
-func (r *PostgresRepository) SaveMetricsGas(lastBlock, safeGasPrice, proposeGasPrice, fastGasPrice, suggestBaseFee string) error {
-	logger.Logger.WithField("lastBlock", lastBlock).Info("Проверка существования метрик газа")
+func (r *PostgresRepository) SaveMetrics(primaryKeyValue interface{}, primaryKeyField string, metrics map[string]interface{}, nameTable string) error {
+	logger.Logger.WithField("primaryKeyValue", primaryKeyValue).Info("Проверка существования метрик")
 
-	// Проверяем, существует ли уже запись с таким lastBlock
+	// Проверяем, существует ли уже запись с таким primaryKeyValue
 	var exists bool
-	err := r.pool.QueryRow(context.Background(), "SELECT EXISTS(SELECT 1 FROM gas_metrics WHERE lastBlock = $1)", lastBlock).Scan(&exists)
+	queryCheck := fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM %s WHERE %s = $1)", nameTable, primaryKeyField)
+	err := r.pool.QueryRow(context.Background(), queryCheck, primaryKeyValue).Scan(&exists)
 	if err != nil {
-		logger.Logger.WithError(err).WithField("lastBlock", lastBlock).Error("Ошибка при проверке существования блока")
-		return fmt.Errorf("ошибка при проверке существования блока: %v", err)
+		logger.Logger.WithError(err).WithField("primaryKeyValue", primaryKeyValue).Error("Ошибка при проверке существования записи")
+		return fmt.Errorf("ошибка при проверке существования записи: %v", err)
+	}
+
+	// Динамическое формирование SQL-запросов
+	fields := []string{}
+	placeholders := []string{}
+	values := []interface{}{primaryKeyValue} // Используем primaryKeyValue вместо lastBlock
+	updateParts := []string{}
+
+	i := 2 // Начинаем с $2, так как $1 уже занят primaryKeyValue
+	for key, value := range metrics {
+		fields = append(fields, key)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", i))
+		updateParts = append(updateParts, fmt.Sprintf("%s = $%d", key, i))
+		values = append(values, value)
+		i++
 	}
 
 	if exists {
-		// Обновляем данные, если блок уже есть
-		updateQuery := `UPDATE gas_metrics SET safeGasPrice = $2, proposeGasPrice = $3, fastGasPrice = $4, suggestBaseFee = $5 
-						WHERE lastBlock = $1`
-		_, err := r.pool.Exec(context.Background(), updateQuery, lastBlock, safeGasPrice, proposeGasPrice, fastGasPrice, suggestBaseFee)
+		// Обновляем данные
+		updateQuery := fmt.Sprintf("UPDATE %s SET %s WHERE %s = $1", nameTable, strings.Join(updateParts, ", "), primaryKeyField)
+		_, err = r.pool.Exec(context.Background(), updateQuery, values...)
 		if err != nil {
-			logger.Logger.WithError(err).WithField("lastBlock", lastBlock).Error("Ошибка при обновлении метрик")
-			return fmt.Errorf("ошибка при обновлении метрик для блока: %v", err)
+			logger.Logger.WithError(err).WithField("primaryKeyValue", primaryKeyValue).Error("Ошибка при обновлении метрик")
+			return fmt.Errorf("ошибка при обновлении метрик для записи: %v", err)
 		}
-
-		logger.Logger.WithField("lastBlock", lastBlock).Info("Метрики успешно обновлены")
+		logger.Logger.WithField("primaryKeyValue", primaryKeyValue).Info("Метрики успешно обновлены")
 		return nil
 	}
 
 	// Вставляем новую запись
-	insertQuery := `INSERT INTO gas_metrics (lastBlock, safeGasPrice, proposeGasPrice, fastGasPrice, suggestBaseFee) 
-                    VALUES ($1, $2, $3, $4, $5)`
-	_, err = r.pool.Exec(context.Background(), insertQuery, lastBlock, safeGasPrice, proposeGasPrice, fastGasPrice, suggestBaseFee)
+	insertQuery := fmt.Sprintf(
+		"INSERT INTO %s (%s, %s) VALUES ($1, %s)",
+		nameTable,
+		primaryKeyField, // Теперь используем primaryKeyField
+		strings.Join(fields, ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	_, err = r.pool.Exec(context.Background(), insertQuery, values...)
 	if err != nil {
-		logger.Logger.WithError(err).WithField("lastBlock", lastBlock).Error("Ошибка при сохранении метрик")
+		logger.Logger.WithError(err).WithField("primaryKeyValue", primaryKeyValue).Error("Ошибка при сохранении метрик")
 		return fmt.Errorf("ошибка при сохранении метрик: %v", err)
 	}
 

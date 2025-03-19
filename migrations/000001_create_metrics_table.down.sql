@@ -1,1 +1,1 @@
-DROP TABLE  gas_metrics 
+DROP TABLE  block_metrics 

@@ -1,10 +1,9 @@
 package metrics
 
 import (
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
+	"math/big"
+	"strings"
+	"time"
 
 	"eth_metrics2.0/internal/client"
 	"eth_metrics2.0/internal/logger"
@@ -25,63 +24,102 @@ func NewCollectorEtherscan(ethClient *client.EthereumClientEtherscan, repo repos
 	}
 }
 
-type GasStatsResponse struct {
-	Status  string `json:"status"`
-	Message string `json:"message"`
-	Result  struct {
-		LastBlock       string `json:"LastBlock"`
-		SafeGasPrice    string `json:"SafeGasPrice"`
-		ProposeGasPrice string `json:"ProposeGasPrice"`
-		FastGasPrice    string `json:"FastGasPrice"`
-		SuggestBaseFee  string `json:"suggestBaseFee"`
-		GasUsedRatio    string `json:"gasUsedRatio"`
-	} `json:"result"`
+type Collector interface {
+	CollectAndSave() error
 }
 
-// CollectAndSaveGas собирает метрики по газу (медленная, средняя, быстрая, базовая комиссия) из сети Ethereum и сохраняет их в базу данных.
-func (c *CollectorEtherscan) CollectAndSaveGas() error {
-	url := fmt.Sprintf("https://api.etherscan.io/api?module=gastracker&action=gasoracle&apikey=%s", c.ethClient.ApiKey)
-	logger.Logger.WithField("url", url).Info("Отправка запроса к API Etherscan")
+// CollectAndSave собирает метрики из сети Ethereum через Etherscan API и сохраняет их в базу данных.
+func (c *CollectorEtherscan) CollectAndSave() error {
+	// Логируем начало процесса сбора данных
+	logger.Logger.WithField("action", "CollectAndSave").Info("Начинаем сбор данных о последнем блоке")
 
-	resp, err := http.Get(url)
+	// Получаем данные о последнем блоке
+	blockData, err := c.ethClient.GetBlockData("latest")
 	if err != nil {
-		logger.Logger.WithError(err).Error("Ошибка при запросе к API")
-		return fmt.Errorf("ошибка при запросе к API: %v", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.Logger.WithError(err).Error("Ошибка при чтении ответа от API")
-		return fmt.Errorf("ошибка при чтении ответа: %v", err)
+		logger.Logger.WithError(err).WithField("action", "CollectAndSave").Error("Ошибка при запросе к API")
+		return err
 	}
 
-	var gasStats GasStatsResponse
-	err = json.Unmarshal(body, &gasStats)
-	if err != nil {
-		logger.Logger.WithError(err).Error("Ошибка при разборе JSON")
-		return fmt.Errorf("ошибка при разборе JSON: %v", err)
+	// Проверяем, если в данных есть результат
+	if blockData["result"] != nil {
+		block := blockData["result"].(map[string]interface{})
+
+		// Логируем номер блока
+		blockNumberInt := hexInt(block, "number")
+
+		// Логируем время создания блока
+		timestamp := hexInt(block, "timestamp")
+		timeCreated := time.Unix(timestamp.Int64(), 0)
+
+		// Логируем количество использованного газа
+		gasUsed := hexInt(block, "gasUsed")
+
+		// Получаем транзакции блока
+		transactions := block["transactions"].([]interface{})
+		lenBlock := len(transactions)
+
+		// Логируем gasPrice для каждой транзакции
+		gasprice := metricTransactions(transactions, "gasPrice")
+
+		// Рассчитываем общую комиссию
+		totalFees := new(big.Int).Mul(sumSlice(gasprice), gasUsed)
+
+		// Формируем метрики блока
+		metricBlock := map[string]interface{}{
+			"Transaction_count": lenBlock,
+			"Fees":              totalFees,
+			"Created_at":        timeCreated,
+		}
+
+		// Логируем перед сохранением в базу
+		logger.Logger.WithField("block_number", blockNumberInt.Int64()).Info("Сохраняем метрики для блока")
+		err = c.repo.SaveMetrics(blockNumberInt.Int64(), "LastBlock", metricBlock, "block_metrics")
+		if err != nil {
+			logger.Logger.WithError(err).WithField("block_number", blockNumberInt.Int64()).Error("Ошибка при сохранении данных")
+			return err
+		}
+
+		// Логируем успешное сохранение
+		logger.Logger.WithField("block_number", blockNumberInt.Int64()).Info("Метрики успешно сохранены для блока")
 	}
 
-	logger.Logger.WithFields(map[string]interface{}{
-		"lastBlock":       gasStats.Result.LastBlock,
-		"safeGasPrice":    gasStats.Result.SafeGasPrice,
-		"proposeGasPrice": gasStats.Result.ProposeGasPrice,
-		"fastGasPrice":    gasStats.Result.FastGasPrice,
-		"suggestBaseFee":  gasStats.Result.SuggestBaseFee,
-	}).Info("Успешно получены данные о газе")
-
-	err = c.repo.SaveMetricsGas(
-		gasStats.Result.LastBlock,
-		gasStats.Result.SafeGasPrice,
-		gasStats.Result.ProposeGasPrice,
-		gasStats.Result.FastGasPrice,
-		gasStats.Result.SuggestBaseFee,
-	)
-	if err != nil {
-		logger.Logger.WithError(err).Error("Ошибка при сохранении метрик газа в базу")
-		return fmt.Errorf("ошибка при сохранении метрик газа: %v", err)
-	}
-
+	// Логируем завершение процесса
+	logger.Logger.WithField("action", "CollectAndSave").Info("Сбор данных завершен.")
 	return nil
+}
+
+// Достает метрики из транзакции и выводит срез из них
+func metricTransactions(transactions []interface{}, metric string) []*big.Int {
+	var metrics []*big.Int
+	for _, tx := range transactions {
+		txData := tx.(map[string]interface{})
+		metricBigInt := hexInt(txData, metric)
+		metrics = append(metrics, metricBigInt)
+	}
+	return metrics
+}
+
+// hexBigInt конвертирует hex-строку в *big.Int
+func hexInt(data map[string]interface{}, metric string) *big.Int {
+	metricHex, ok := data[metric].(string)
+	if !ok {
+		logger.Logger.WithField("metric", metric).Error("Ошибка: поле отсутствует или имеет неверный тип")
+	}
+
+	metricHex = strings.TrimPrefix(metricHex, "0x") // Убираем "0x"
+	metricBigInt := new(big.Int)
+	_, success := metricBigInt.SetString(metricHex, 16) // Парсим 16-ричное число
+	if !success {
+		logger.Logger.WithField("metric", metric).Error("Ошибка при преобразовании hex строки в big.Int")
+	}
+	return metricBigInt
+}
+
+// Считает сумму слайса
+func sumSlice(slice []*big.Int) *big.Int {
+	sum := new(big.Int)
+	for _, num := range slice {
+		sum.Add(sum, num)
+	}
+	return sum
 }
